@@ -1,5 +1,5 @@
 #!/bin/bash
-
+export DEBIAN_FRONTEND=noninteractive
 # Цвета для вывода
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -16,9 +16,26 @@ check_command() {
     fi
 }
 
-# Запрос ввода данных у пользователя
-echo -e "${YELLOW}Введите доменное имя (например, domain.ru, как указывали в .env при настройке MD):${NC}"
+# Запрос ввода данных MultiDirectory у пользователя
+echo -e "${YELLOW}Введите доменное имя MULTIDIRECTORY (например, domain.ru):${NC}"
 read -r DOMAIN
+
+echo -e "${YELLOW}Введите IP-адрес сервера MULTIDIRECTORY (например, 192.168.1.2):${NC}"
+read -r LDAP_IP
+
+# Проверка, что IP и домен не пустые
+if [[ -z "$LDAP_IP" || -z "$DOMAIN" ]]; then
+    echo -e "${RED}Ошибка: IP и доменное имя должны быть заполнены!${NC}"
+    exit 1
+fi
+
+# Добавляем запись в /etc/hosts, если её ещё нет
+if ! grep -qE "^[[:space:]]*$LDAP_IP[[:space:]]+$DOMAIN" /etc/hosts; then
+    echo "$LDAP_IP $DOMAIN" >> /etc/hosts
+    echo -e "${GREEN}Добавлена запись в /etc/hosts: $LDAP_IP $DOMAIN${NC}"
+else
+    echo -e "${YELLOW}Запись в /etc/hosts уже существует: $LDAP_IP $DOMAIN${NC}"
+fi
 
 echo -e "${YELLOW}Введите REALM (например, DOMAIN.RU):${NC}"
 read -r REALM
@@ -26,15 +43,18 @@ read -r REALM
 echo -e "${YELLOW}Введите BASE DN (например, dc=domain,dc=ru):${NC}"
 read -r LDAP_BASE_DN
 
-echo -e "${YELLOW}Введите логин сервсиной учетной записи LDAP (например, cn=admin,ou=users,$LDAP_BASE_DN):${NC}"
+echo -e "${YELLOW}Введите DN администратора LDAP (например, cn=admin,ou=users,$LDAP_BASE_DN):${NC}"
+read -r BIND_DN
+
+echo -e "${YELLOW}Введите логин администратора LDAP (например, admin):${NC}"
 read -r LOGIN
 
-echo -e "${YELLOW}Введите пароль сервисной учетной записи LDAP:${NC}"
+echo -e "${YELLOW}Введите пароль администратора LDAP:${NC}"
 read -rs PASSWORD
 echo
 
 # Проверка введенных данных
-if [[ -z "$DOMAIN" || -z "$REALM" || -z "$LDAP_BASE_DN" || -z "$LOGIN" || -z "$PASSWORD" ]]; then
+if [[ -z "$DOMAIN" || -z "$REALM" || -z "$LDAP_BASE_DN" || -z "$BIND_DN" || -z "$PASSWORD" || -z "$LOGIN" ]]; then
     echo -e "${RED}Ошибка: Все поля должны быть заполнены!${NC}"
     exit 1
 fi
@@ -44,12 +64,10 @@ SUBSTRING=".$DOMAIN"
 KDC=$DOMAIN
 KADMIN=$DOMAIN
 URI="ldap://$DOMAIN"
-HOSTNAME=$(hostname -s)  # Только короткое имя хоста
-COMPUTER_DN="cn=$HOSTNAME,ou=computers,$LDAP_BASE_DN"
+HOSTNAME=$(hostname -s)
 LDAP_SEARCH_BASE=$LDAP_BASE_DN
-LDAP_SUDO_BASE="cn=domain admins,cn=groups,$LDAP_BASE_DN"
+#LDAP_SUDO_BASE="cn=domain admins,cn=groups,$LDAP_BASE_DN"
 LDAP_USER_BASE=$LDAP_BASE_DN
-SSSD_NESTING_LEVEL='1000'
 SUDO_GROUP='"%domain admins" ALL=(ALL) ALL'
 
 # Обновление и установка необходимых пакетов
@@ -66,6 +84,7 @@ if command -v apt-get &> /dev/null; then
     echo -e "${GREEN}Обновление пакетов (APT)...${NC}"
     apt-get update -q > /dev/null
     check_command "Обновление пакетов APT"
+    apt-get install -y --no-install-recommends krb5-user > /dev/null 2>&1
     packages=(krb5-user libpam-krb5 sssd-ldap sssd-krb5 sssd sssd-tools ldap-utils jq curl)
 elif command -v yum &> /dev/null; then
     PKG_MANAGER="yum"
@@ -161,10 +180,13 @@ cat > /etc/krb5.conf <<EOF
     forwardable = true
     proxiable = true
     fcc-mit-ticket-flags = true
+    ticket_lifetime = 7d
+    renew_lifetime = 14d
 [realms]
     $REALM = {
         kdc = $KDC
         admin_server = $KADMIN
+        auth_to_local = DEFAULT
     }
 [domain_realm]
     .$DOMAIN = $REALM
@@ -180,13 +202,16 @@ cat > /etc/sssd/sssd.conf <<EOF
     config_file_version = 2
     domains = $DOMAIN
     services = nss, pam, ssh
-
+[nss]
+    memcache_timeout = 60
+[pam]
+    offline_credentials_expiration = 5
 [domain/$DOMAIN]
-    ldap_schema = rfc2307bis 
-    ldap_group_nesting_level = $SSSD_NESTING_LEVEL
-    ldap_default_bind_dn = $LOGIN
+    ldap_schema = rfc2307bis
+    ldap_group_nesting_level = 1000
+    ldap_default_bind_dn = $BIND_DN
     ldap_default_authtok = $PASSWORD
-    ldap_default_authtok_type = password
+    ldap_default_authtok_type = obfuscated_password
     id_provider = ldap
     ldap_uri = $URI
     ldap_search_base = $LDAP_SEARCH_BASE
@@ -195,11 +220,23 @@ cat > /etc/sssd/sssd.conf <<EOF
     krb5_kpasswd = $KDC
     krb5_realm = $REALM
     cache_credentials = True
-    ldap_id_use_start_tls = false
+    ldap_id_use_start_tls = False
     ldap_group_search_base = $LDAP_SEARCH_BASE
-    ldap_sudo_search_base = $LDAP_SUDO_BASE
     ldap_user_search_base = $LDAP_USER_BASE
+    access_provider = permit
+    sudo_provider = ldap
+    chpass_provider = krb5
+    autofs_provider = ldap
+    resolver_provider = ldap
+    sudo_provider = ldap
+[sudo]
+    ldap_sudo_smart_refresh_interval = 0
+    ldap_sudo_full_refresh_interval = 2
+    debug_level = 0x3ff0
 EOF
+#echo -d $DOMAIN $PASSWORD | sss_obfuscate
+echo -e "${GREEN}Введите пароль администратора, который ввели ранее, для шифрования пароля в конфигурации SSSD. ${NC}"
+sss_obfuscate -d ${DOMAIN} 
 check_command "Настройка SSSD"
 
 # Настройка прав доступа
@@ -271,7 +308,7 @@ GSSAPIAuthentication yes
 GSSAPICleanupCredentials yes
 
 # Безопасность
-AllowTcpForwarding no
+AllowTcpForwarding yes
 ClientAliveInterval 120
 ClientAliveCountMax 2
 X11Forwarding yes
@@ -289,18 +326,48 @@ check_command "Настройка SSH"
 # Добавление группы в sudoers
 echo -e "${GREEN}Настройка sudoers...${NC}"
 if ! grep -Fxq "$SUDO_GROUP" /etc/sudoers; then
-    echo '%#513 ALL=(ALL) ALL'
     echo "$SUDO_GROUP" >> /etc/sudoers
     check_command "Добавление прав sudo для domain admins"
 else
     echo -e "${GREEN}Права sudo для domain admins уже настроены.${NC}"
 fi
 
+# Создание ПК и скачивание кейтаба
+HOSTNAME=$(hostname -s)
+access_token=$(curl --insecure -s -X POST "https://${DOMAIN}/api/auth/" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=${LOGIN}&password=${PASSWORD}" \
+  -D - | grep -i 'set-cookie: id=' | sed -n 's/.*id=\([^;]*\).*/\1/p')
+
+curl --insecure -sS -X POST "https://${DOMAIN}/api/entry/add" \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H "Cookie: id=${access_token}" \
+  -d "{
+    \"entry\": \"cn=${HOSTNAME},ou=Computers,${LDAP_BASE_DN}\",
+    \"attributes\": [
+      { \"type\": \"objectClass\", \"vals\": [\"top\",\"computer\"] },
+      { \"type\": \"description\", \"vals\": [\"\"] }
+    ]
+  }"
+
+curl --insecure -sS -X POST "https://${DOMAIN}/api/kerberos/ktadd" \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H "Cookie: id=${access_token}" \
+  -d "[\"host/${HOSTNAME}\", \"host/${HOSTNAME}.${DOMAIN}\"]" \
+  --output /etc/krb5.keytab
+
+klist -k /etc/krb5.keytab
+
 # Запуск и включение служб
 echo -e "${GREEN}Запуск служб...${NC}"
 systemctl restart sssd sshd
 systemctl enable sssd
 check_command "Запуск служб"
+
+#systemctl restart salt-minion
 
 echo -e "${GREEN}\nНастройка завершена успешно!${NC}"
 echo -e "${YELLOW}Рекомендуется перезагрузить систему для применения всех изменений.${NC}"
